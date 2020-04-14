@@ -139,7 +139,10 @@ def _dist_train(model,
         find_unused_parameters=find_unused_parameters)
 
     # build runner
-    optimizer = build_optimizer(model, cfg.optimizer)
+    if cfg.optimizer.type=='SGD_GC':
+      optimizer = SGD_GC(model.parameters(), cfg.optimizer.lr, momentum=cfg.optimizer.momentum,weight_decay=cfg.optimizer.weight_decay)
+    else:
+      optimizer = build_optimizer(model, cfg.optimizer)
     runner = Runner(
         model,
         batch_processor,
@@ -206,8 +209,7 @@ def _non_dist_train(model,
     if cfg.optimizer.type=='SGD_GC':
       optimizer = SGD_GC(model.parameters(), cfg.optimizer.lr, momentum=cfg.optimizer.momentum,weight_decay=cfg.optimizer.weight_decay)
     else:
-      optimizer = build_optimizer(model, cfg.optimizer)
-       
+      optimizer = build_optimizer(model, cfg.optimizer)       
     runner = Runner(
         model,
         batch_processor,

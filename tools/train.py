@@ -1,151 +1,246 @@
-from __future__ import division
-import argparse
-import copy
-import os
-import os.path as osp
-import time
+import random
+from collections import OrderedDict
 
-import mmcv
+import numpy as np
 import torch
-from mmcv import Config
-from mmcv.runner import init_dist
+import torch.distributed as dist
+from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
+from mmcv.runner import DistSamplerSeedHook, Runner
 
-from mmdet import __version__
-from mmdet.apis import set_random_seed, train_detector
-from mmdet.datasets import build_dataset
-from mmdet.models import build_detector
-from mmdet.utils import collect_env, get_root_logger
+from mmdet.core import (DistEvalHook, DistOptimizerHook, EvalHook,
+                        Fp16OptimizerHook, build_optimizer)
+from mmdet.datasets import build_dataloader, build_dataset
+from mmdet.utils import get_root_logger
+from SGD import SGD_GC
 
+def set_random_seed(seed, deterministic=False):
+    """Set random seed.
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='Train a detector')
-    parser.add_argument('config', help='train config file path')
-    parser.add_argument('--work_dir', help='the dir to save logs and models')
-    parser.add_argument(
-        '--resume_from', help='the checkpoint file to resume from')
-    parser.add_argument(
-        '--validate',
-        action='store_true',
-        help='whether to evaluate the checkpoint during training')
-    group_gpus = parser.add_mutually_exclusive_group()
-    group_gpus.add_argument(
-        '--gpus',
-        type=int,
-        help='number of gpus to use '
-        '(only applicable to non-distributed training)')
-    group_gpus.add_argument(
-        '--gpu-ids',
-        type=int,
-        nargs='+',
-        help='ids of gpus to use '
-        '(only applicable to non-distributed training)')
-    parser.add_argument('--seed', type=int, default=None, help='random seed')
-    parser.add_argument(
-        '--deterministic',
-        action='store_true',
-        help='whether to set deterministic options for CUDNN backend.')
-    parser.add_argument(
-        '--launcher',
-        choices=['none', 'pytorch', 'slurm', 'mpi'],
-        default='none',
-        help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
-    parser.add_argument(
-        '--autoscale-lr',
-        action='store_true',
-        help='automatically scale lr with the number of gpus')
-    args = parser.parse_args()
-    if 'LOCAL_RANK' not in os.environ:
-        os.environ['LOCAL_RANK'] = str(args.local_rank)
-
-    return args
+    Args:
+        seed (int): Seed to be used.
+        deterministic (bool): Whether to set the deterministic option for
+            CUDNN backend, i.e., set `torch.backends.cudnn.deterministic`
+            to True and `torch.backends.cudnn.benchmark` to False.
+            Default: False.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
-def main():
-    args = parse_args()
+def parse_losses(losses):
+    log_vars = OrderedDict()
+    for loss_name, loss_value in losses.items():
+        if isinstance(loss_value, torch.Tensor):
+            log_vars[loss_name] = loss_value.mean()
+        elif isinstance(loss_value, list):
+            log_vars[loss_name] = sum(_loss.mean() for _loss in loss_value)
+        else:
+            raise TypeError(
+                '{} is not a tensor or list of tensors'.format(loss_name))
 
-    cfg = Config.fromfile(args.config)
-    # set cudnn_benchmark
-    if cfg.get('cudnn_benchmark', False):
-        torch.backends.cudnn.benchmark = True
-    # update configs according to CLI args
-    if args.work_dir is not None:
-        cfg.work_dir = args.work_dir
-    if args.resume_from is not None:
-        cfg.resume_from = args.resume_from
-    if args.gpu_ids is not None:
-        cfg.gpu_ids = args.gpu_ids
+    loss = sum(_value for _key, _value in log_vars.items() if 'loss' in _key)
+
+    log_vars['loss'] = loss
+    for loss_name, loss_value in log_vars.items():
+        # reduce loss when distributed training
+        if dist.is_available() and dist.is_initialized():
+            loss_value = loss_value.data.clone()
+            dist.all_reduce(loss_value.div_(dist.get_world_size()))
+        log_vars[loss_name] = loss_value.item()
+
+    return loss, log_vars
+
+
+def batch_processor(model, data, train_mode):
+    """Process a data batch.
+
+    This method is required as an argument of Runner, which defines how to
+    process a data batch and obtain proper outputs. The first 3 arguments of
+    batch_processor are fixed.
+
+    Args:
+        model (nn.Module): A PyTorch model.
+        data (dict): The data batch in a dict.
+        train_mode (bool): Training mode or not. It may be useless for some
+            models.
+
+    Returns:
+        dict: A dict containing losses and log vars.
+    """
+    losses = model(**data)
+    loss, log_vars = parse_losses(losses)
+
+    outputs = dict(
+        loss=loss, log_vars=log_vars, num_samples=len(data['img'].data))
+
+    return outputs
+
+
+def train_detector(model,
+                   dataset,
+                   cfg,
+                   distributed=False,
+                   validate=False,
+                   timestamp=None,
+                   meta=None):
+    logger = get_root_logger(cfg.log_level)
+
+    # start training
+    if distributed:
+        _dist_train(
+            model,
+            dataset,
+            cfg,
+            validate=validate,
+            logger=logger,
+            timestamp=timestamp,
+            meta=meta)
     else:
-        cfg.gpu_ids = range(1) if args.gpus is None else range(args.gpus)
+        _non_dist_train(
+            model,
+            dataset,
+            cfg,
+            validate=validate,
+            logger=logger,
+            timestamp=timestamp,
+            meta=meta)
 
-    if args.autoscale_lr:
-        # apply the linear scaling rule (https://arxiv.org/abs/1706.02677)
-        cfg.optimizer['lr'] = cfg.optimizer['lr'] * len(cfg.gpu_ids) / 8
 
-    # init distributed env first, since logger depends on the dist info.
-    if args.launcher == 'none':
-        distributed = False
-    else:
-        distributed = True
-        init_dist(args.launcher, **cfg.dist_params)
+def _dist_train(model,
+                dataset,
+                cfg,
+                validate=False,
+                logger=None,
+                timestamp=None,
+                meta=None):
+    # prepare data loaders
+    dataset = dataset if isinstance(dataset, (list, tuple)) else [dataset]
+    data_loaders = [
+        build_dataloader(
+            ds,
+            cfg.data.imgs_per_gpu,
+            cfg.data.workers_per_gpu,
+            dist=True,
+            seed=cfg.seed) for ds in dataset
+    ]
+    # put model on gpus
+    find_unused_parameters = cfg.get('find_unused_parameters', False)
+    # Sets the `find_unused_parameters` parameter in
+    # torch.nn.parallel.DistributedDataParallel
+    model = MMDistributedDataParallel(
+        model.cuda(),
+        device_ids=[torch.cuda.current_device()],
+        broadcast_buffers=False,
+        find_unused_parameters=find_unused_parameters)
 
-    # create work_dir
-    mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
-    # init the logger before other steps
-    timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
-    log_file = osp.join(cfg.work_dir, '{}.log'.format(timestamp))
-    logger = get_root_logger(log_file=log_file, log_level=cfg.log_level)
-
-    # init the meta dict to record some important information such as
-    # environment info and seed, which will be logged
-    meta = dict()
-    # log env info
-    env_info_dict = collect_env()
-    env_info = '\n'.join([('{}: {}'.format(k, v))
-                          for k, v in env_info_dict.items()])
-    dash_line = '-' * 60 + '\n'
-    logger.info('Environment info:\n' + dash_line + env_info + '\n' +
-                dash_line)
-    meta['env_info'] = env_info
-
-    # log some basic info
-    logger.info('Distributed training: {}'.format(distributed))
-    logger.info('Config:\n{}'.format(cfg.text))
-
-    # set random seeds
-    if args.seed is not None:
-        logger.info('Set random seed to {}, deterministic: {}'.format(
-            args.seed, args.deterministic))
-        set_random_seed(args.seed, deterministic=args.deterministic)
-    cfg.seed = args.seed
-    meta['seed'] = args.seed
-
-    model = build_detector(
-        cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
-
-    datasets = [build_dataset(cfg.data.train)]
-    if len(cfg.workflow) == 2:
-        val_dataset = copy.deepcopy(cfg.data.val)
-        val_dataset.pipeline = cfg.data.train.pipeline
-        datasets.append(build_dataset(val_dataset))
-    if cfg.checkpoint_config is not None:
-        # save mmdet version, config file content and class names in
-        # checkpoints as meta data
-        cfg.checkpoint_config.meta = dict(
-            mmdet_version=__version__,
-            config=cfg.text,
-            CLASSES=datasets[0].CLASSES)
-    # add an attribute for visualization convenience
-    model.CLASSES = datasets[0].CLASSES
-    train_detector(
+    # build runner
+    optimizer = build_optimizer(model, cfg.optimizer)
+    runner = Runner(
         model,
-        datasets,
-        cfg,
-        distributed=distributed,
-        validate=args.validate,
-        timestamp=timestamp,
+        batch_processor,
+        optimizer,
+        cfg.work_dir,
+        logger=logger,
         meta=meta)
+    # an ugly walkaround to make the .log and .log.json filenames the same
+    runner.timestamp = timestamp
+
+    # fp16 setting
+    fp16_cfg = cfg.get('fp16', None)
+    if fp16_cfg is not None:
+        optimizer_config = Fp16OptimizerHook(**cfg.optimizer_config,
+                                             **fp16_cfg)
+    else:
+        optimizer_config = DistOptimizerHook(**cfg.optimizer_config)
+
+    # register hooks
+    runner.register_training_hooks(cfg.lr_config, optimizer_config,
+                                   cfg.checkpoint_config, cfg.log_config)
+    runner.register_hook(DistSamplerSeedHook())
+    # register eval hooks
+    if validate:
+        val_dataset = build_dataset(cfg.data.val, dict(test_mode=True))
+        val_dataloader = build_dataloader(
+            val_dataset,
+            imgs_per_gpu=1,
+            workers_per_gpu=cfg.data.workers_per_gpu,
+            dist=True,
+            shuffle=False)
+        eval_cfg = cfg.get('evaluation', {})
+        runner.register_hook(DistEvalHook(val_dataloader, **eval_cfg))
+
+    if cfg.resume_from:
+        runner.resume(cfg.resume_from)
+    elif cfg.load_from:
+        runner.load_checkpoint(cfg.load_from)
+    runner.run(data_loaders, cfg.workflow, cfg.total_epochs)
 
 
-if __name__ == '__main__':
-    main()
+def _non_dist_train(model,
+                    dataset,
+                    cfg,
+                    validate=False,
+                    logger=None,
+                    timestamp=None,
+                    meta=None):
+    # prepare data loaders
+    dataset = dataset if isinstance(dataset, (list, tuple)) else [dataset]
+    data_loaders = [
+        build_dataloader(
+            ds,
+            cfg.data.imgs_per_gpu,
+            cfg.data.workers_per_gpu,
+            len(cfg.gpu_ids),
+            dist=False,
+            seed=cfg.seed) for ds in dataset
+    ]
+    # put model on gpus
+    model = MMDataParallel(model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
+
+    # build runner
+    if cfg.optimizer.type=='SGD_GC':
+      optimizer = SGD_GC(model.parameters(), cfg.optimizer.lr, momentum=cfg.optimizer.momentum,weight_decay=cfg.optimizer.weight_decay)
+    else:
+      optimizer = build_optimizer(model, cfg.optimizer)
+       
+    runner = Runner(
+        model,
+        batch_processor,
+        optimizer,
+        cfg.work_dir,
+        logger=logger,
+        meta=meta)
+    # an ugly walkaround to make the .log and .log.json filenames the same
+    runner.timestamp = timestamp
+    # fp16 setting
+    fp16_cfg = cfg.get('fp16', None)
+    if fp16_cfg is not None:
+        optimizer_config = Fp16OptimizerHook(
+            **cfg.optimizer_config, **fp16_cfg, distributed=False)
+    else:
+        optimizer_config = cfg.optimizer_config
+    runner.register_training_hooks(cfg.lr_config, optimizer_config,
+                                   cfg.checkpoint_config, cfg.log_config)
+
+    # register eval hooks
+    if validate:
+        val_dataset = build_dataset(cfg.data.val, dict(test_mode=True))
+        val_dataloader = build_dataloader(
+            val_dataset,
+            imgs_per_gpu=1,
+            workers_per_gpu=cfg.data.workers_per_gpu,
+            dist=False,
+            shuffle=False)
+        eval_cfg = cfg.get('evaluation', {})
+        runner.register_hook(EvalHook(val_dataloader, **eval_cfg))
+
+    if cfg.resume_from:
+        runner.resume(cfg.resume_from)
+    elif cfg.load_from:
+        runner.load_checkpoint(cfg.load_from)
+    runner.run(data_loaders, cfg.workflow, cfg.total_epochs)
